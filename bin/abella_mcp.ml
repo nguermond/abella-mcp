@@ -570,6 +570,10 @@ let tool_abella2tex args =
         if not (Sys.file_exists c) then failwith (Printf.sprintf "No such config file: %s" c);
         Config.load_file cfg c)
       configs;
+    (* Once every config is in -- entries layer, so a template and the
+       macro it calls may come from different files.  Warnings only;
+       they reach the client on the trailing line, as Render's do. *)
+    Config.check cfg;
     let render_one source_text =
       match mode with
       | `Commands ->
@@ -864,6 +868,17 @@ let main () =
   (* A dead Abella subprocess must not take the server down with it. *)
   (try ignore (Sys.signal Sys.sigpipe Sys.Signal_ignore) with Invalid_argument _ -> ());
   at_exit (fun () -> ignore (stop_session ()));
+  (* [at_exit] only runs on a graceful return from [loop] (stdin EOF); an MCP
+     client tearing this process down with a signal instead -- the usual way
+     to stop a stdio server -- would hit OCaml's default disposition, which
+     terminates immediately and skips [at_exit], orphaning the Abella child
+     with no server left that knows its pid to ever kill it again. Routing
+     these through [exit] instead makes the shutdown "graceful" either way. *)
+  let handle_shutdown_signal _ = exit 0 in
+  List.iter
+    (fun sg -> try Sys.set_signal sg (Sys.Signal_handle handle_shutdown_signal)
+      with Invalid_argument _ -> ())
+    [ Sys.sigterm; Sys.sigint ];
   log "started (protocol %s)" protocol_version;
   let rec loop () =
     match input_line stdin with
