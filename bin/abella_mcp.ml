@@ -281,6 +281,200 @@ let error_context ?(before = 12) ?(after = 6) out =
       ^ if hi < n - 1 then "\n... (later output elided) ..." else ""
 
 (* ------------------------------------------------------------------ *)
+(* Proof states, and the delta between two of them                     *)
+(* ------------------------------------------------------------------ *)
+
+(* Abella reprints the whole proof state after every tactic: the induction
+   hypothesis, every unchanged hypothesis, the goal, and the statement of each
+   pending subgoal.  Over a long proof that is the same text again and again,
+   so abella_send reports only what a command actually changed and leaves the
+   full picture to abella_state.
+
+   A state block looks like
+
+     Subgoal 1.1:                 (only inside a multi-subgoal proof)
+
+     Variables: BC ABC            (only when there are eigenvariables)
+     IH : forall A B C, nat A * ->
+            add A B AB            (continuation lines are indented)
+     H3 : add z ABC BC
+     ============================
+      add z BC ABC
+
+     Subgoal 1.2 is:              (pending subgoals: statement only)
+      add z BC (s K)
+*)
+
+type pstate = {
+  messages : string list;         (* lines above the block, e.g. "Error: ..." *)
+  header : string;                (* "Subgoal 1.1:", or "" outside a split *)
+  variables : string;             (* the "Variables: ..." line, or "" *)
+  hyps : (string * string) list;  (* name, text as printed *)
+  goal : string;
+  pending : string list;          (* the "Subgoal N is:" headers *)
+}
+
+let empty_state =
+  { messages = []; header = ""; variables = ""; hyps = []; goal = ""; pending = [] }
+
+(* Wrapping depends on the width of the "NAME : " prefix, so the same formula
+   can be laid out differently under H1 and under H12; compare on collapsed
+   whitespace so that re-wrapping alone never reads as a change. *)
+let normalize s =
+  let b = Buffer.create (String.length s) in
+  let gap = ref true in
+  String.iter
+    (fun c ->
+      if c = ' ' || c = '\t' || c = '\n' || c = '\r' then
+        if not !gap then (Buffer.add_char b ' '; gap := true) else ()
+      else (Buffer.add_char b c; gap := false))
+    s;
+  trim (Buffer.contents b)
+
+let is_separator l =
+  let l = trim l in
+  l <> "" && String.for_all (fun c -> c = '=') l
+
+let is_indented l = l <> "" && (l.[0] = ' ' || l.[0] = '\t')
+
+(* "H1 : nat A @" opens a hypothesis; "Variables: A B" and "Subgoal 1:" do not,
+   because the separator Abella prints is " : ", spaces included. *)
+let hyp_name l =
+  if is_indented l then None
+  else
+    match String.index_opt l ':' with
+    | None -> None
+    | Some i ->
+        if i = 0 || i + 1 >= String.length l then None
+        else if l.[i - 1] <> ' ' || l.[i + 1] <> ' ' then None
+        else
+          let n = trim (String.sub l 0 (i - 1)) in
+          if n <> "" && String.for_all is_name_char n then Some n else None
+
+let is_subgoal_header l =
+  let l = trim l in
+  String.starts_with ~prefix:"Subgoal " l
+  && String.ends_with ~suffix:":" l
+  && not (String.ends_with ~suffix:" is:" l)
+
+let is_pending_header l =
+  let l = trim l in
+  String.starts_with ~prefix:"Subgoal " l && String.ends_with ~suffix:" is:" l
+
+let last_index_of p ls =
+  let rec go i best = function
+    | [] -> best
+    | x :: rest -> go (i + 1) (if p x then Some i else best) rest
+  in
+  go 0 None ls
+
+let parse_above ls =
+  let messages = ref [] and header = ref "" and variables = ref "" in
+  let hyps = ref [] and cur = ref None in
+  let flush () =
+    match !cur with
+    | Some (n, buf) ->
+        hyps := (n, String.concat "\n" (List.rev buf)) :: !hyps;
+        cur := None
+    | None -> ()
+  in
+  List.iter
+    (fun l ->
+      match hyp_name l with
+      | Some n -> flush (); cur := Some (n, [ l ])
+      | None ->
+          if trim l = "" then ()
+          else if is_subgoal_header l then (flush (); header := trim l)
+          else if String.starts_with ~prefix:"Variables:" (trim l) then
+            (flush (); variables := trim l)
+          else (
+            match !cur with
+            | Some (n, buf) when is_indented l -> cur := Some (n, l :: buf)
+            | _ -> flush (); messages := trim l :: !messages))
+    ls;
+  flush ();
+  (List.rev !messages, !header, !variables, List.rev !hyps)
+
+let parse_below ls =
+  let rec split acc = function
+    | [] -> (List.rev acc, [])
+    | l :: rest when is_pending_header l -> (List.rev acc, l :: rest)
+    | l :: rest -> split (l :: acc) rest
+  in
+  let goal_ls, pend_ls = split [] ls in
+  (trim (String.concat "\n" goal_ls), List.filter_map
+     (fun l -> if is_pending_header l then Some (trim l) else None) pend_ls)
+
+(* [None] when the reply carries no proof state at all: a top-level command, a
+   "Proof completed", a bare error. *)
+let parse_state out =
+  let ls = lines_of out in
+  match last_index_of is_separator ls with
+  | None -> None
+  | Some sep ->
+      let above = List.filteri (fun i _ -> i < sep) ls in
+      let below = List.filteri (fun i _ -> i > sep) ls in
+      let messages, header, variables, hyps = parse_above above in
+      let goal, pending = parse_below below in
+      Some { messages; header; variables; hyps; goal; pending }
+
+let render_delta ~prev ~curr =
+  let out = Buffer.create 256 in
+  let add s = Buffer.add_string out s; Buffer.add_char out '\n' in
+  let changed =
+    List.filter
+      (fun (n, t) ->
+        match List.assoc_opt n prev.hyps with
+        | Some t' -> normalize t <> normalize t'
+        | None -> true)
+      curr.hyps
+  in
+  let unchanged =
+    List.filter_map
+      (fun (n, t) ->
+        match List.assoc_opt n prev.hyps with
+        | Some t' when normalize t = normalize t' -> Some n
+        | _ -> None)
+      curr.hyps
+  in
+  let removed =
+    List.filter_map
+      (fun (n, _) -> if List.mem_assoc n curr.hyps then None else Some n)
+      prev.hyps
+  in
+  let new_header = curr.header <> "" && curr.header <> prev.header in
+  let new_vars = curr.variables <> "" && normalize curr.variables <> normalize prev.variables in
+  let new_goal = normalize curr.goal <> normalize prev.goal in
+  let np = List.length curr.pending and np_prev = List.length prev.pending in
+  let quiet =
+    curr.messages = [] && (not new_header) && (not new_vars) && (not new_goal)
+    && changed = [] && removed = [] && np = np_prev
+  in
+  if quiet then add "(state unchanged)"
+  else begin
+    List.iter add curr.messages;
+    if new_header then add curr.header;
+    if new_vars then add curr.variables;
+    if removed <> [] then add ("- " ^ String.concat ", " removed);
+    List.iter (fun (_, t) -> add t) changed;
+    if unchanged <> [] then add ("(unchanged: " ^ String.concat ", " unchanged ^ ")");
+    add (if new_goal then "goal: " ^ curr.goal else "goal: (unchanged)");
+    if np > 0 then
+      add (Printf.sprintf "(%d other subgoal%s pending)" np (if np = 1 then "" else "s"))
+    else if np_prev > 0 then add "(no other subgoals pending)"
+  end;
+  trim (Buffer.contents out)
+
+(* What to show for one command: the change if we can read a proof state out of
+   the reply, the reply itself otherwise. *)
+let summarize ~prev ~curr =
+  match parse_state curr with
+  | None -> trim curr
+  | Some c ->
+      let p = match parse_state prev with Some p -> p | None -> empty_state in
+      render_delta ~prev:p ~curr:c
+
+(* ------------------------------------------------------------------ *)
 (* Tools                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -326,7 +520,7 @@ let split_commands src =
   flush ();
   List.rev !cmds
 
-let send_commands ?(timeout = default_timeout) s cmds =
+let send_commands ?(timeout = default_timeout) ?(verbose = false) s cmds =
   let transcript = Buffer.create 256 in
   let error = ref None in
   let rec go = function
@@ -335,9 +529,11 @@ let send_commands ?(timeout = default_timeout) s cmds =
         write_line s cmd;
         match read_until_prompt ~timeout s with
         | Prompt (out, name) ->
+            let prev = s.last_state in
             s.prompt <- name;
             s.last_state <- out;
-            Buffer.add_string transcript (Printf.sprintf "> %s\n%s" cmd (trim out));
+            let shown = if verbose then trim out else summarize ~prev ~curr:out in
+            Buffer.add_string transcript (Printf.sprintf "> %s\n%s" cmd shown);
             Buffer.add_char transcript '\n';
             if output_has_error out then error := Some (`Cmd cmd)
             else go rest
@@ -389,10 +585,13 @@ let tool_send args =
     | Some t -> t
     | None -> default_timeout
   in
+  let verbose =
+    Yojson.Safe.Util.(args |> member "verbose" |> to_bool_option) |> Option.value ~default:false
+  in
   let cmds = split_commands commands in
   if cmds = [] then ("No commands to send.", false)
   else
-    let transcript, error = send_commands ~timeout s cmds in
+    let transcript, error = send_commands ~timeout ~verbose s cmds in
     match error with
     | None ->
         let prompt = match !current with Some s -> s.prompt | None -> "?" in
@@ -435,6 +634,44 @@ let tool_stop _args =
   if stop_session () then ("Abella session stopped.", false)
   else ("No session was running.", false)
 
+(* A proof closed with the `skip` tactic is reported as
+   "Proof completed *** USING skip ***", and a file full of them still exits 0
+   -- so a bare "OK" would hide that nothing was actually proved.  Attributing
+   each skip to the theorem it closes takes the most recent "Theorem NAME :"
+   Abella echoed, which keeps the names in file order. *)
+let skip_marker = "*** USING skip ***"
+
+let theorem_name l =
+  let l = trim l in
+  let p = "Theorem " in
+  if not (String.starts_with ~prefix:p l) then None
+  else
+    let rest = String.sub l (String.length p) (String.length l - String.length p) in
+    let n = match String.index_opt rest ' ' with Some i -> String.sub rest 0 i | None -> rest in
+    let n = if String.ends_with ~suffix:":" n then String.sub n 0 (String.length n - 1) else n in
+    if n <> "" && String.for_all is_name_char n then Some n else None
+
+let skipped_theorems out =
+  let rec go current acc = function
+    | [] -> List.rev acc
+    | l :: rest -> (
+        match theorem_name l with
+        | Some n -> go (Some n) acc rest
+        | None ->
+            if contains ~needle:skip_marker l then
+              go current (match current with Some n -> n :: acc | None -> acc) rest
+            else go current acc rest)
+  in
+  go None [] (lines_of out)
+
+let skip_report out =
+  let skipped = lines_of out |> List.filter (contains ~needle:skip_marker) |> List.length in
+  if skipped = 0 then ""
+  else
+    let names = skipped_theorems out in
+    Printf.sprintf "\n\n%d proof(s) closed with skip%s" skipped
+      (if names = [] then "." else ": " ^ String.concat ", " names ^ ".")
+
 (* Batch check: run Abella non-interactively over a file and report the
    outcome.  Abella signals failure through its exit status here. *)
 let tool_check args =
@@ -466,15 +703,16 @@ let tool_check args =
   let diags = diagnostics out in
   let ok = status = Unix.WEXITED 0 && diags = [] in
   let name = Filename.basename file in
+  let skips = skip_report out in
   if ok then
     let completed =
       lines_of out |> List.filter (fun l -> contains ~needle:"Proof completed" l) |> List.length
     in
-    (Printf.sprintf "%s: OK -- %d proof(s) completed." name completed, false)
+    (Printf.sprintf "%s: OK -- %d proof(s) completed.%s" name completed skips, false)
   else
-    ( Printf.sprintf "%s: FAILED.\n\n%s\n\nContext:\n\n%s" name
+    ( Printf.sprintf "%s: FAILED.\n\n%s\n\nContext:\n\n%s%s" name
         (String.concat "\n" (List.map (fun d -> "  " ^ d) diags))
-        (error_context out),
+        (error_context out) skips,
       true )
 
 (* ------------------------------------------------------------------ *)
@@ -628,8 +866,10 @@ let tools =
     { name = "abella_check";
       description =
         "Batch-check an Abella .thm file end to end and report whether every \
-         proof completed. Use this to verify a file after editing it. Returns \
-         the tail of Abella's output, where any error appears.";
+         proof completed, plus how many were closed with 'skip' (and which \
+         theorems those were) -- a file whose proofs are all skipped still \
+         checks out. Use this to verify a file after editing it. Returns the \
+         tail of Abella's output, where any error appears.";
       schema = obj [ ("file", str_prop "Path to the .thm file to check.") ] [ "file" ];
       run = tool_check };
     { name = "abella_start";
@@ -649,25 +889,35 @@ let tools =
       run = tool_start };
     { name = "abella_send";
       description =
-        "Send one or more commands to the running Abella session and return \
-         the transcript with the resulting proof state. Commands are ordinary \
-         Abella syntax terminated by '.', e.g. 'intros. case H1. search.'; \
-         both top-level commands (Kind, Type, Define, Theorem) and proof \
-         tactics are accepted. Stops at the first command that errors, so \
-         earlier commands' effects still stand.";
+        "Send one or more commands to the running Abella session. Commands are \
+         ordinary Abella syntax terminated by '.', e.g. 'intros. case H1. \
+         search.'; both top-level commands (Kind, Type, Define, Theorem) and \
+         proof tactics are accepted. Stops at the first command that errors, so \
+         earlier commands' effects still stand.\n\n\
+         Each command reports only what it CHANGED, not the whole state: new \
+         and altered hypotheses in full, removed ones as '- H1, H2', untouched \
+         ones as '(unchanged: IH, H3)', then 'goal:' (or 'goal: (unchanged)') \
+         and a count of the other pending subgoals. Use abella_state for the \
+         full state, including the statements of those pending subgoals, or \
+         pass verbose=true here.";
       schema =
         obj
           [ ("commands", str_prop
                "Abella commands, each terminated by '.'. Comments are allowed.");
             ("timeout_seconds", num_prop
                "Per-command timeout. Defaults to 60. Raise it for a deep \
-                'search'.") ]
+                'search'.");
+            ("verbose", bool_prop
+               "Print Abella's full output for every command instead of just \
+                the change. Defaults to false.") ]
           [ "commands" ];
       run = tool_send };
     { name = "abella_state";
       description =
-        "Show the current proof state of the running session (the goal, \
-         hypotheses and any remaining subgoals) without changing it.";
+        "Show the current proof state of the running session in full -- every \
+         hypothesis, the goal, and the statement of each remaining subgoal -- \
+         without changing it. This is the counterpart to abella_send, which \
+         reports only what each command changed.";
       schema = obj [] [];
       run = tool_state };
     { name = "abella_undo";

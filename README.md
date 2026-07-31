@@ -54,10 +54,10 @@ e.g. in a consuming project's `.mcp.json`:
 
 | Tool | Purpose |
 | --- | --- |
-| `abella_check` | Batch-check a `.thm` file; reports the diagnostic and the lines around it. |
+| `abella_check` | Batch-check a `.thm` file; reports the diagnostic and the lines around it, and how many proofs were closed with `skip`. |
 | `abella_start` | Start/restart an interactive session, optionally loading a file. |
-| `abella_send` | Send commands; returns the transcript and resulting proof state. |
-| `abella_state` | Show the current proof state without changing it. |
+| `abella_send` | Send commands; returns the transcript and what each command *changed* in the proof state. |
+| `abella_state` | Show the current proof state in full without changing it. |
 | `abella_undo` | Undo the last *n* proof commands. |
 | `abella_stop` | Stop the session. |
 | `abella2tex` | Render a term, `Define` clauses, or a whole `.thm` file's declarations to TeX under a notation configuration. Reports variable-naming collisions inline. |
@@ -65,6 +65,52 @@ e.g. in a consuming project's `.mcp.json`:
 The useful trick: `abella_start` on a file whose last proof is **incomplete**
 loads everything and parks the session exactly at the open subgoal, ready to
 continue — which is how work in progress gets picked up.
+
+### Reporting the change, not the state
+
+Abella reprints the entire proof state after every tactic: the induction
+hypothesis, every untouched hypothesis, the goal, and the statement of each
+pending subgoal. Over a long proof that is the same text again and again, and
+for an agent paying by the token it is the bulk of the transcript. So
+`abella_send` reports only what a command actually changed:
+
+```
+> case H2.
+- H2
+H5 : smem (dconst T Tau) Sig1
+(unchanged: IH, H3, H4)
+goal: (unchanged)
+```
+
+New and altered hypotheses appear in full — those are the ones being reasoned
+about; removed ones are named on the `-` line, untouched ones only named.
+`goal:` carries the conclusion when it moves and `(unchanged)` when it does
+not, a `Subgoal N:` header appears when the position changes, and the pending
+subgoals are reduced to a count. A tactic that changes nothing — a failed
+`search`, say — collapses to `(state unchanged)` under the error.
+
+On a real 15-tactic proof from `terms.thm` this halves the transcript, and the
+saving grows with the size of the state, since what is elided is exactly what
+is being repeated.
+
+Nothing is lost: `abella_state` prints the full state, pending subgoals and
+all, and `abella_send` takes `verbose: true` to get Abella's raw output for
+every command. The diff is computed on collapsed whitespace, so a formula that
+Abella merely re-wraps (its layout depends on the width of the `H1 : ` prefix)
+never reads as a change.
+
+### Skips
+
+`skip` closes a goal without proving it. Abella marks such a proof `Proof
+completed *** USING skip ***` and still exits 0, so a file whose proofs are
+all skipped passes an unqualified check. `abella_check` therefore reports them,
+attributed to the theorems they close, in file order:
+
+```
+grounding.thm: OK -- 30 proof(s) completed.
+
+8 proof(s) closed with skip: sapp_sharp, sapp_apply, sapp_t_open, ...
+```
 
 ## How it works
 
