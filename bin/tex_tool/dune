@@ -1,0 +1,8 @@
+(library
+ (name tex_tool)
+ (libraries
+  unix
+  yojson
+  (select tex_tool.ml from
+   (abella2tex -> tex_tool.real.ml)
+   (-> tex_tool.stub.ml))))

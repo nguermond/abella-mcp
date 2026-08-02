@@ -2,4 +2,4 @@
  (name abella_mcp)
  (public_name abella_mcp)
  (package abella_mcp)
- (libraries abella2tex unix yojson jsonrpc))
+ (libraries tex_tool unix yojson jsonrpc))
