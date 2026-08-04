@@ -3,7 +3,7 @@
 **`abella_mcp`** (`bin/abella_mcp.ml`) — an MCP server exposing the
 [Abella](https://abella-prover.org/) proof assistant to an agent. The agent
 drives Abella interactively over a long-lived session instead of shelling out
-and re-running whole files, and — via the `abella2tex` library — can
+and re-running whole files, and — via the (separate) `abella2tex` library — can
 render Abella terms and statements to TeX without a separate CLI either.
 
 ## Tools
@@ -59,17 +59,6 @@ every command. The diff is computed on collapsed whitespace, so a formula that
 Abella merely re-wraps (its layout depends on the width of the `H1 : ` prefix)
 never reads as a change.
 
-`abella_send` has two more options:
-
-- `timeout_seconds` — the per-command timeout, a number; defaults to 15. Raise
-  it for a deep `search`. On timeout the session is killed (to avoid the
-  master and REPL desynchronising) and must be restarted with `abella_start`.
-- `collapse` — suppress the per-command deltas and report a single delta from
-  before the whole batch to after it. The command that stops the batch (error,
-  timeout, or exit), if any, is always reported in full.
-
-Sending stops at the first command that fails, so the effects of the commands
-before it still stand and the session stays usable.
 
 ### Skips
 
