@@ -29,6 +29,8 @@ let server_name = "abella"
 let server_version = "0.1.0"
 
 let default_timeout = 15.0
+let send_timeout = 5.0
+let check_timeout = 10.0
 
 open Parsing
 
@@ -401,7 +403,7 @@ let tool_send args =
   let timeout =
     match Yojson.Safe.Util.(args |> member "timeout_seconds" |> to_number_option) with
     | Some t -> t
-    | None -> default_timeout
+    | None -> send_timeout
   in
   let verbose =
     Yojson.Safe.Util.(args |> member "verbose" |> to_bool_option) |> Option.value ~default:false
@@ -495,6 +497,7 @@ let skip_report out =
 
 (* Batch check: run Abella non-interactively over a file and report the
    outcome.  Abella signals failure through its exit status here. *)
+
 let tool_check args =
   let file = Yojson.Safe.Util.(args |> member "file" |> to_string) in
   let file = if Filename.is_relative file then Filename.concat (Sys.getcwd ()) file else file in
@@ -511,30 +514,59 @@ let tool_check args =
   in
   Unix.close out_write;
   Unix.close devnull;
+  Unix.set_nonblock out_read;
   let buf = Buffer.create 4096 in
   let bytes = Bytes.create 65536 in
+  (* Drain Abella's output, but give up after check_timeout seconds: a hung
+     proof (e.g. a tactic that loops) would otherwise block this tool forever.
+     We poll the pipe with Unix.select so a quiet child does not hold us up. *)
+  let deadline = Unix.gettimeofday () +. check_timeout in
+  let timed_out = ref false in
   let rec drain () =
-    let n = try Unix.read out_read bytes 0 (Bytes.length bytes) with Unix.Unix_error _ -> 0 in
-    if n > 0 then (Buffer.add_subbytes buf bytes 0 n; drain ())
+    let remaining = deadline -. Unix.gettimeofday () in
+    if remaining <= 0. then timed_out := true
+    else begin
+      let ready, _, _ =
+        try Unix.select [ out_read ] [] [] (Float.min 0.25 remaining)
+        with Unix.Unix_error (Unix.EINTR, _, _) -> ([], [], [])
+      in
+      if ready = [] then drain ()
+      else begin
+        let n =
+          try Unix.read out_read bytes 0 (Bytes.length bytes)
+          with Unix.Unix_error _ -> 0
+        in
+        if n > 0 then (Buffer.add_subbytes buf bytes 0 n; drain ())
+        (* n = 0 means EOF: the child closed the pipe, stop draining. *)
+      end
+    end
   in
   drain ();
-  Unix.close out_read;
+  let timed_out = !timed_out in
+  (try if timed_out then Unix.kill pid Sys.sigterm with Unix.Unix_error _ -> ());
   let _, status = Unix.waitpid [] pid in
+  (try Unix.close out_read with Unix.Unix_error _ -> ());
   let out = Buffer.contents buf in
-  let diags = diagnostics out in
-  let ok = status = Unix.WEXITED 0 && diags = [] in
-  let name = Filename.basename file in
-  let skips = skip_report out in
-  if ok then
-    let completed =
-      lines_of out |> List.filter (fun l -> contains ~needle:"Proof completed" l) |> List.length
-    in
-    (Printf.sprintf "%s: OK -- %d proof(s) completed.%s" name completed skips, false)
-  else
-    ( Printf.sprintf "%s: FAILED.\n\n%s\n\nContext:\n\n%s%s" name
-        (String.concat "\n" (List.map (fun d -> "  " ^ d) diags))
-        (error_context out) skips,
+  if timed_out then
+    ( Printf.sprintf "%s: TIMED OUT after %.0f seconds.\n\n%s\n\nContext:\n\n%s"
+        (Filename.basename file) check_timeout out (error_context out),
       true )
+  else begin
+    let diags = diagnostics out in
+    let ok = status = Unix.WEXITED 0 && diags = [] in
+    let name = Filename.basename file in
+    let skips = skip_report out in
+    if ok then
+      let completed =
+        lines_of out |> List.filter (fun l -> contains ~needle:"Proof completed" l) |> List.length
+      in
+      (Printf.sprintf "%s: OK -- %d proof(s) completed.%s" name completed skips, false)
+    else
+      ( Printf.sprintf "%s: FAILED.\n\n%s\n\nContext:\n\n%s%s" name
+          (String.concat "\n" (List.map (fun d -> "  " ^ d) diags))
+          (error_context out) skips,
+        true )
+  end
 
 (* ------------------------------------------------------------------ *)
 (* Tool registry                                                       *)
@@ -619,7 +651,7 @@ let tools =
           [ ("commands", str_prop
                "Abella commands, each terminated by '.'. Comments are allowed.");
             ("timeout_seconds", num_prop
-               "Per-command timeout. Defaults to 15. Raise it for a deep \
+               "Per-command timeout. Defaults to 5. Raise it for a deep \
                 'search'.");
             ("verbose", bool_prop
                "Print Abella's full output for every command instead of just \
