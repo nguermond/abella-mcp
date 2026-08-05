@@ -460,7 +460,7 @@ let tool_send args =
     Yojson.Safe.Util.(args |> member "verbose" |> to_bool_option) |> Option.value ~default:false
   in
   let collapse =
-    Yojson.Safe.Util.(args |> member "collapse" |> to_bool_option) |> Option.value ~default:false
+    Yojson.Safe.Util.(args |> member "collapse" |> to_bool_option) |> Option.value ~default:true
   in
   let cmds = split_commands commands in
   if cmds = [] then ("No commands to send.", false)
@@ -692,17 +692,18 @@ let tools =
          Type, Define, Theorem) and proof tactics are accepted. Stops at the \
          first command that errors, so earlier commands' effects still \
          stand.\n\n\
-         Each command reports only what it CHANGED, not the whole state: new \
-         and altered hypotheses in full, removed ones as '- H1, H2', untouched \
-         ones as '(unchanged: IH, H3)', then 'goal:' (or 'goal: (unchanged)') \
-         and a count of the other pending subgoals. Use abella_state for the \
-         full state, including the statements of those pending subgoals, or \
-         pass verbose=true here.\n\n\
-         Set collapse=true to suppress the per-command deltas and report a \
-         single delta from before the whole batch to after it -- useful when \
-         sending several tactics at once and only the net effect matters. \
+         The report is a delta, not the whole state: new and altered \
+         hypotheses in full, removed ones as '- H1, H2', untouched ones as \
+         '(unchanged: IH, H3)', then 'goal:' (or 'goal: (unchanged)') and a \
+         count of the other pending subgoals. Use abella_state for the full \
+         state, including the statements of those pending subgoals, or pass \
+         verbose=true here.\n\n\
+         By default (collapse=true) the delta covers the whole batch: from \
+         before the first command to after the last. Set collapse=false to \
+         see a delta per command instead -- useful when you need to see \
+         where in the middle of a multi-command batch something changed. \
          The command that stops the batch (error, timeout, or exit), if any, \
-         is still shown in full either way.";
+         is always shown in full either way.";
       schema =
         obj
           [ ("session_id", str_prop "Identifier returned by abella_start.");
@@ -716,7 +717,7 @@ let tools =
                 the change. Defaults to false.");
             ("collapse", bool_prop
                "Report only the net change from before the batch to after it, \
-                instead of a delta per command. Defaults to false.") ]
+                instead of a delta per command. Defaults to true.") ]
           [ "session_id"; "commands" ];
       run = tool_send };
     { name = "abella_state";
