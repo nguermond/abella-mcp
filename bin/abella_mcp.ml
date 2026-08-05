@@ -128,34 +128,45 @@ type read_result =
   | Timed_out of string
   | Eof of string
 
-let read_until_prompt ?(timeout = default_timeout) s =
+(* Read from fd until either `stop` accepts the accumulated output, the
+   deadline passes (Timed_out), or the child closes the pipe (Eof).  The
+   pipe is polled with Unix.select in <=0.25s slices so a quiet child does
+   not hold us up past the deadline.  `stop` is consulted on the current
+   buffer at the top of each iteration (before any read), so a prompt that
+   is already present returns immediately; pass `fun _ -> None` to read to
+   EOF, which is what the batch checker wants. *)
+let read_with_deadline ?(timeout = default_timeout) fd ~stop =
   let buf = Buffer.create 4096 in
   let bytes = Bytes.create 65536 in
   let deadline = Unix.gettimeofday () +. timeout in
   let rec loop () =
     let contents = Buffer.contents buf in
-    match prompt_suffix contents with
-    | Some name -> Prompt (strip_prompt contents, name)
+    match stop contents with
+    | Some r -> r
     | None ->
         let remaining = deadline -. Unix.gettimeofday () in
         if remaining <= 0. then Timed_out contents
         else
           let ready, _, _ =
-            try Unix.select [ s.from_abella ] [] [] (Float.min 0.25 remaining)
+            try Unix.select [ fd ] [] [] (Float.min 0.25 remaining)
             with Unix.Unix_error (Unix.EINTR, _, _) -> ([], [], [])
           in
           if ready = [] then loop ()
           else
             let n =
-              try Unix.read s.from_abella bytes 0 (Bytes.length bytes)
+              try Unix.read fd bytes 0 (Bytes.length bytes)
               with Unix.Unix_error _ -> 0
             in
             if n = 0 then Eof contents
-            else (
-              Buffer.add_subbytes buf bytes 0 n;
-              loop ())
+            else (Buffer.add_subbytes buf bytes 0 n; loop ())
   in
   loop ()
+
+let read_until_prompt ?(timeout = default_timeout) s =
+  read_with_deadline ~timeout s.from_abella ~stop:(fun contents ->
+    Option.map
+      (fun name -> Prompt (strip_prompt contents, name))
+      (prompt_suffix contents))
 
 let write_line s line =
   let data = Bytes.of_string (line ^ "\n") in
@@ -515,38 +526,20 @@ let tool_check args =
   Unix.close out_write;
   Unix.close devnull;
   Unix.set_nonblock out_read;
-  let buf = Buffer.create 4096 in
-  let bytes = Bytes.create 65536 in
-  (* Drain Abella's output, but give up after check_timeout seconds: a hung
-     proof (e.g. a tactic that loops) would otherwise block this tool forever.
-     We poll the pipe with Unix.select so a quiet child does not hold us up. *)
-  let deadline = Unix.gettimeofday () +. check_timeout in
-  let timed_out = ref false in
-  let rec drain () =
-    let remaining = deadline -. Unix.gettimeofday () in
-    if remaining <= 0. then timed_out := true
-    else begin
-      let ready, _, _ =
-        try Unix.select [ out_read ] [] [] (Float.min 0.25 remaining)
-        with Unix.Unix_error (Unix.EINTR, _, _) -> ([], [], [])
-      in
-      if ready = [] then drain ()
-      else begin
-        let n =
-          try Unix.read out_read bytes 0 (Bytes.length bytes)
-          with Unix.Unix_error _ -> 0
-        in
-        if n > 0 then (Buffer.add_subbytes buf bytes 0 n; drain ())
-        (* n = 0 means EOF: the child closed the pipe, stop draining. *)
-      end
-    end
+  (* Drain Abella's output to EOF, but give up after check_timeout seconds: a
+     hung proof (e.g. a tactic that loops) would otherwise block this tool
+     forever.  Batch Abella prints no prompt, so we read until it exits (EOF);
+     a timeout means the child is stuck and is killed below. *)
+  let result = read_with_deadline ~timeout:check_timeout out_read ~stop:(fun _ -> None) in
+  let timed_out, out =
+    match result with
+    | Timed_out o -> (true, o)
+    | Eof o -> (false, o)
+    | Prompt _ -> (false, "")  (* unreachable: stop never returns Some *)
   in
-  drain ();
-  let timed_out = !timed_out in
   (try if timed_out then Unix.kill pid Sys.sigterm with Unix.Unix_error _ -> ());
   let _, status = Unix.waitpid [] pid in
   (try Unix.close out_read with Unix.Unix_error _ -> ());
-  let out = Buffer.contents buf in
   if timed_out then
     ( Printf.sprintf "%s: TIMED OUT after %.0f seconds.\n\n%s\n\nContext:\n\n%s"
         (Filename.basename file) check_timeout out (error_context out),
