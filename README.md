@@ -8,7 +8,7 @@ render Abella terms and statements to TeX without a separate CLI either.
 
 ## Tools
 
-The server exposes seven tools over MCP stdio.
+The server exposes eight tools over MCP stdio.
 
 | Tool | Purpose |
 | --- | --- |
@@ -18,7 +18,18 @@ The server exposes seven tools over MCP stdio.
 | `abella_state` | Show the current proof state in full, without changing it. |
 | `abella_undo` | Undo the last *n* proof commands. |
 | `abella_stop` | Stop the session and release the Abella subprocess. |
+| `abella_sessions` | List all currently running sessions. |
 | `abella2tex` | Render a term, `Define` clauses, or a whole `.thm` file's declarations to TeX under a notation configuration. Note: `abella2tex` must be installed separately. |
+
+### Multiple sessions
+
+Any number of interactive sessions can run at once, each with its own Abella
+subprocess and proof state. `abella_start` returns a `session_id` — generate
+one automatically by omitting it, or pass your own — and every other
+session-scoped tool (`abella_send`, `abella_state`, `abella_undo`,
+`abella_stop`) requires that `session_id` back. Reusing an existing id with
+`abella_start` restarts *that* session only; other sessions are unaffected.
+Use `abella_sessions` to list what's currently running if an id gets lost.
 
 ### Picking up work in progress
 

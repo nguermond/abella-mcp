@@ -98,6 +98,7 @@ let strip_prompt s =
 (* ------------------------------------------------------------------ *)
 
 type session = {
+  id : string;
   pid : int;
   to_abella : Unix.file_descr;
   from_abella : Unix.file_descr;
@@ -107,7 +108,26 @@ type session = {
   mutable last_state : string;
 }
 
-let current : session option ref = ref None
+let sessions : (string, session) Hashtbl.t = Hashtbl.create 8
+let max_sessions = 16
+
+let () = Random.self_init ()
+
+(* Random rather than sequential ("s1", "s2", ...) so that an explicitly
+   chosen id from one agent can never accidentally land on another agent's
+   auto-assigned session -- which would silently kill it, the exact bug
+   multi-session support exists to fix. *)
+let fresh_session_id () =
+  let rec go () =
+    let id = Printf.sprintf "auto-%08x" (Random.bits ()) in
+    if Hashtbl.mem sessions id then go () else id
+  in
+  go ()
+
+let active_sessions_hint () =
+  match Hashtbl.fold (fun k _ acc -> k :: acc) sessions [] |> List.sort compare with
+  | [] -> "No sessions are running."
+  | ids -> "Active sessions: " ^ String.concat ", " ids ^ "."
 
 let close_session s =
   (try Unix.close s.to_abella with Unix.Unix_error _ -> ());
@@ -115,13 +135,9 @@ let close_session s =
   (try Unix.kill s.pid Sys.sigterm with Unix.Unix_error _ -> ());
   (try ignore (Unix.waitpid [] s.pid) with Unix.Unix_error _ -> ())
 
-let stop_session () =
-  match !current with
-  | None -> false
-  | Some s ->
-      close_session s;
-      current := None;
-      true
+let remove_session s =
+  Hashtbl.remove sessions s.id;
+  close_session s
 
 type read_result =
   | Prompt of string * string  (* output (prompt stripped), prompt name *)
@@ -177,8 +193,18 @@ let write_line s line =
   in
   go 0 (Bytes.length data)
 
-let start_session ?file ?cwd () =
-  ignore (stop_session ());
+let start_session ?id ?file ?cwd () =
+  let id = match id with Some id -> id | None -> fresh_session_id () in
+  (match Hashtbl.find_opt sessions id with
+  | Some old -> remove_session old
+  | None ->
+      if Hashtbl.length sessions >= max_sessions then
+        failwith
+          (Printf.sprintf
+             "Too many Abella sessions already running (limit %d). Use \
+              abella_sessions to see them and abella_stop to release ones \
+              you no longer need."
+             max_sessions));
   let bin = Lazy.force abella_bin in
   let cwd =
     match (cwd, file) with
@@ -198,8 +224,8 @@ let start_session ?file ?cwd () =
   in
   if not (Sys.file_exists file_arg) then
     failwith (Printf.sprintf "No such file: %s" file_arg);
-  let in_read, in_write = Unix.pipe ~cloexec:false () in
-  let out_read, out_write = Unix.pipe ~cloexec:false () in
+  let in_read, in_write = Unix.pipe ~cloexec:true () in
+  let out_read, out_write = Unix.pipe ~cloexec:true () in
   let pid =
     let cwd_before = Sys.getcwd () in
     Sys.chdir cwd;
@@ -212,10 +238,10 @@ let start_session ?file ?cwd () =
   Unix.close out_write;
   Unix.set_nonblock out_read;
   let s =
-    { pid; to_abella = in_write; from_abella = out_read; file; cwd;
+    { id; pid; to_abella = in_write; from_abella = out_read; file; cwd;
       prompt = "Abella"; last_state = "" }
   in
-  current := Some s;
+  Hashtbl.replace sessions id s;
   let result = read_until_prompt s in
   Option.iter (fun t -> try Sys.remove t with Sys_error _ -> ()) temp;
   match result with
@@ -224,19 +250,26 @@ let start_session ?file ?cwd () =
       s.last_state <- out;
       (s, out)
   | Timed_out out ->
-      ignore (stop_session ());
+      remove_session s;
       failwith ("Abella did not become ready within the timeout. Output so far:\n" ^ out)
   | Eof out ->
-      ignore (stop_session ());
+      remove_session s;
       failwith ("Abella exited while starting up. Output:\n" ^ out)
 
-let require_session () =
-  match !current with
+let require_session id =
+  match Hashtbl.find_opt sessions id with
   | Some s -> s
   | None ->
       failwith
-        "No Abella session is running. Use abella_start first (optionally with \
-         a file to load)."
+        (Printf.sprintf
+           "No Abella session %S is running. Use abella_start first \
+            (optionally with a file to load). %s"
+           id (active_sessions_hint ()))
+
+let required_session_id args =
+  match Yojson.Safe.Util.(args |> member "session_id" |> to_string_option) with
+  | Some id -> id
+  | None -> failwith (Printf.sprintf "session_id is required. %s" (active_sessions_hint ()))
 
 (* ------------------------------------------------------------------ *)
 (* Interpreting Abella's replies                                       *)
@@ -345,8 +378,10 @@ let send_commands ?(timeout = default_timeout) ?(verbose = false) ?(collapse = f
   let rec go = function
     | [] -> ()
     | cmd :: rest -> (
-        write_line s cmd;
-        match read_until_prompt ~timeout s with
+        match
+          write_line s cmd;
+          read_until_prompt ~timeout s
+        with
         | Prompt (out, name) ->
             let prev = s.last_state in
             s.prompt <- name;
@@ -365,13 +400,17 @@ let send_commands ?(timeout = default_timeout) ?(verbose = false) ?(collapse = f
               go rest
             end
         | Timed_out out ->
-            ignore (stop_session ());
+            remove_session s;
             Buffer.add_string transcript
               (Printf.sprintf "> %s\n%s\n" cmd (trim out));
             error := Some (`Timeout (cmd, timeout))
         | Eof out ->
-            ignore (stop_session ());
+            remove_session s;
             Buffer.add_string transcript (Printf.sprintf "> %s\n%s\n" cmd (trim out));
+            error := Some `Exited
+        | exception Unix.Unix_error _ ->
+            remove_session s;
+            Buffer.add_string transcript (Printf.sprintf "> %s\n(Abella exited)\n" cmd);
             error := Some `Exited)
   in
   go cmds;
@@ -384,11 +423,12 @@ let send_commands ?(timeout = default_timeout) ?(verbose = false) ?(collapse = f
 let tool_start args =
   let file = Yojson.Safe.Util.(args |> member "file" |> to_string_option) in
   let cwd = Yojson.Safe.Util.(args |> member "cwd" |> to_string_option) in
-  let s, out = start_session ?file ?cwd () in
+  let id = Yojson.Safe.Util.(args |> member "session_id" |> to_string_option) in
+  let s, out = start_session ?id ?file ?cwd () in
   let header =
     match file with
-    | Some f -> Printf.sprintf "Started Abella session on %s." (Filename.basename f)
-    | None -> "Started an empty Abella session."
+    | Some f -> Printf.sprintf "Started Abella session %s on %s." s.id (Filename.basename f)
+    | None -> Printf.sprintf "Started an empty Abella session %s." s.id
   in
   (* Loading a file echoes every command in it; report the state it landed in
      and any diagnostics, not the echo. *)
@@ -406,10 +446,10 @@ let tool_start args =
         (if state = "" then "" else "\n\nCurrent state:\n\n" ^ state)
   in
   s.last_state <- state;
-  (Printf.sprintf "%s\n\n%s\n\n[prompt: %s]" header body s.prompt, diags <> [])
+  (Printf.sprintf "%s\n\n%s\n\n[session: %s | prompt: %s]" header body s.id s.prompt, diags <> [])
 
 let tool_send args =
-  let s = require_session () in
+  let s = require_session (required_session_id args) in
   let commands = Yojson.Safe.Util.(args |> member "commands" |> to_string) in
   let timeout =
     match Yojson.Safe.Util.(args |> member "timeout_seconds" |> to_number_option) with
@@ -428,8 +468,7 @@ let tool_send args =
     let transcript, error = send_commands ~timeout ~verbose ~collapse s cmds in
     match error with
     | None ->
-        let prompt = match !current with Some s -> s.prompt | None -> "?" in
-        (trim transcript ^ Printf.sprintf "\n\n[prompt: %s]" prompt, false)
+        (trim transcript ^ Printf.sprintf "\n\n[session: %s | prompt: %s]" s.id s.prompt, false)
     | Some (`Cmd cmd) ->
         ( trim transcript
           ^ Printf.sprintf "\n\nStopped: %S reported an error; remaining commands were not sent." cmd,
@@ -444,15 +483,15 @@ let tool_send args =
     | Some `Exited ->
         (trim transcript ^ "\n\nAbella exited. Restart with abella_start.", true)
 
-let tool_state _args =
-  let s = require_session () in
+let tool_state args =
+  let s = require_session (required_session_id args) in
   let body = if trim s.last_state = "" then "(no proof state; at top level)" else trim s.last_state in
   let loaded = match s.file with Some f -> f | None -> "(none)" in
-  ( Printf.sprintf "%s\n\n[file: %s | cwd: %s | prompt: %s]" body loaded s.cwd s.prompt,
+  ( Printf.sprintf "%s\n\n[session: %s | file: %s | cwd: %s | prompt: %s]" body s.id loaded s.cwd s.prompt,
     false )
 
 let tool_undo args =
-  let s = require_session () in
+  let s = require_session (required_session_id args) in
   let count =
     match Yojson.Safe.Util.(args |> member "count" |> to_int_option) with
     | Some n when n > 0 -> n
@@ -461,12 +500,27 @@ let tool_undo args =
   let cmds = List.init count (fun _ -> "undo.") in
   let transcript, error = send_commands s cmds in
   match error with
-  | None -> (trim transcript ^ Printf.sprintf "\n\n[prompt: %s]" s.prompt, false)
+  | None -> (trim transcript ^ Printf.sprintf "\n\n[session: %s | prompt: %s]" s.id s.prompt, false)
   | Some _ -> (trim transcript, true)
 
-let tool_stop _args =
-  if stop_session () then ("Abella session stopped.", false)
-  else ("No session was running.", false)
+let tool_stop args =
+  let id = required_session_id args in
+  match Hashtbl.find_opt sessions id with
+  | Some s -> remove_session s; (Printf.sprintf "Abella session %s stopped." id, false)
+  | None -> (Printf.sprintf "No session %s was running." id, false)
+
+let tool_sessions _args =
+  let entries =
+    Hashtbl.fold
+      (fun _ s acc ->
+        let loaded = match s.file with Some f -> f | None -> "(none)" in
+        Printf.sprintf "%s | file: %s | cwd: %s | prompt: %s" s.id loaded s.cwd s.prompt :: acc)
+      sessions []
+    |> List.sort compare
+  in
+  match entries with
+  | [] -> ("No sessions are running.", false)
+  | _ -> (String.concat "\n" entries, false)
 
 (* A proof closed with the `skip` tactic is reported as
    "Proof completed *** USING skip ***", and a file full of them still exits 0
@@ -514,7 +568,7 @@ let tool_check args =
   let file = if Filename.is_relative file then Filename.concat (Sys.getcwd ()) file else file in
   if not (Sys.file_exists file) then failwith (Printf.sprintf "No such file: %s" file);
   let bin = Lazy.force abella_bin in
-  let out_read, out_write = Unix.pipe ~cloexec:false () in
+  let out_read, out_write = Unix.pipe ~cloexec:true () in
   let devnull = Unix.openfile "/dev/null" [ Unix.O_RDONLY ] 0 in
   let cwd_before = Sys.getcwd () in
   Sys.chdir (Filename.dirname file);
@@ -611,23 +665,33 @@ let tools =
         "Start (or restart) an interactive Abella session. If a file is given \
          it is loaded first, and the session is left wherever the file ends -- \
          including at an open subgoal if the file's last proof is incomplete, \
-         which is the usual way to pick up work in progress. Replaces any \
-         existing session.";
+         which is the usual way to pick up work in progress. Multiple sessions \
+         can run at once, each independent; give session_id explicitly to \
+         restart one you already have (replacing only that session), or omit \
+         it to start a new one and get a freshly generated id back -- save \
+         that id and pass it to abella_send/abella_state/abella_undo/\
+         abella_stop. See abella_sessions to list what's currently running.";
       schema =
         obj
           [ ("file", str_prop "Optional .thm file to load before going interactive.");
             ("cwd", str_prop
                "Working directory for resolving Specification/Import. Defaults \
-                to the file's directory.") ]
+                to the file's directory.");
+            ("session_id", str_prop
+               "Optional identifier for this session, e.g. a name unique to \
+                your task. If omitted, one is generated and returned in the \
+                response. If it names an existing session, that session is \
+                restarted; other sessions are never affected.") ]
           [];
       run = tool_start };
     { name = "abella_send";
       description =
-        "Send one or more commands to the running Abella session. Commands are \
-         ordinary Abella syntax terminated by '.', e.g. 'intros. case H1. \
-         search.'; both top-level commands (Kind, Type, Define, Theorem) and \
-         proof tactics are accepted. Stops at the first command that errors, so \
-         earlier commands' effects still stand.\n\n\
+        "Send one or more commands to the running Abella session named by \
+         session_id. Commands are ordinary Abella syntax terminated by '.', \
+         e.g. 'intros. case H1. search.'; both top-level commands (Kind, \
+         Type, Define, Theorem) and proof tactics are accepted. Stops at the \
+         first command that errors, so earlier commands' effects still \
+         stand.\n\n\
          Each command reports only what it CHANGED, not the whole state: new \
          and altered hypotheses in full, removed ones as '- H1, H2', untouched \
          ones as '(unchanged: IH, H3)', then 'goal:' (or 'goal: (unchanged)') \
@@ -641,7 +705,8 @@ let tools =
          is still shown in full either way.";
       schema =
         obj
-          [ ("commands", str_prop
+          [ ("session_id", str_prop "Identifier returned by abella_start.");
+            ("commands", str_prop
                "Abella commands, each terminated by '.'. Comments are allowed.");
             ("timeout_seconds", num_prop
                "Per-command timeout. Defaults to 5. Raise it for a deep \
@@ -652,26 +717,34 @@ let tools =
             ("collapse", bool_prop
                "Report only the net change from before the batch to after it, \
                 instead of a delta per command. Defaults to false.") ]
-          [ "commands" ];
+          [ "session_id"; "commands" ];
       run = tool_send };
     { name = "abella_state";
       description =
-        "Show the current proof state of the running session in full -- every \
-         hypothesis, the goal, and the statement of each remaining subgoal -- \
-         without changing it. This is the counterpart to abella_send, which \
-         reports only what each command changed.";
-      schema = obj [] [];
+        "Show the current proof state of the session named by session_id in \
+         full -- every hypothesis, the goal, and the statement of each \
+         remaining subgoal -- without changing it. This is the counterpart \
+         to abella_send, which reports only what each command changed.";
+      schema = obj [ ("session_id", str_prop "Identifier returned by abella_start.") ] [ "session_id" ];
       run = tool_state };
     { name = "abella_undo";
       description =
-        "Undo the last proof command(s) in the running session. Only \
-         meaningful inside a proof.";
-      schema = obj [ ("count", int_prop "How many commands to undo. Defaults to 1.") ] [];
+        "Undo the last proof command(s) in the session named by session_id. \
+         Only meaningful inside a proof.";
+      schema =
+        obj
+          [ ("session_id", str_prop "Identifier returned by abella_start.");
+            ("count", int_prop "How many commands to undo. Defaults to 1.") ]
+          [ "session_id" ];
       run = tool_undo };
     { name = "abella_stop";
-      description = "Stop the running Abella session and release the subprocess.";
-      schema = obj [] [];
+      description = "Stop the Abella session named by session_id and release its subprocess.";
+      schema = obj [ ("session_id", str_prop "Identifier returned by abella_start.") ] [ "session_id" ];
       run = tool_stop };
+    { name = "abella_sessions";
+      description = "List all currently running Abella sessions and their state.";
+      schema = obj [] [];
+      run = tool_sessions };
     { name = "abella2tex";
       description =
         (if Tex_tool.available then ""
@@ -820,7 +893,7 @@ let handle_packet (packet : Rpc.Packet.t) =
 let main () =
   (* A dead Abella subprocess must not take the server down with it. *)
   (try ignore (Sys.signal Sys.sigpipe Sys.Signal_ignore) with Invalid_argument _ -> ());
-  at_exit (fun () -> ignore (stop_session ()));
+  at_exit (fun () -> Hashtbl.iter (fun _ s -> close_session s) sessions);
   (* [at_exit] only runs on a graceful return from [loop] (stdin EOF); an MCP
      client tearing this process down with a signal instead -- the usual way
      to stop a stdio server -- would hit OCaml's default disposition, which

@@ -3,6 +3,11 @@ opam-version: "2.0"
 version: "0.1.1"
 synopsis:
   "MCP server exposing the Abella proof assistant, including abella2tex rendering"
+maintainer: ["nguermond@proton.me"]
+authors: ["Nathan Guermond"]
+license: "GPL-3.0-or-later"
+homepage: "https://github.com/nguermond/abella-mcp"
+bug-reports: "https://github.com/nguermond/abella-mcp/issues"
 depends: [
   "dune" {>= "3.7"}
   "ocaml"
@@ -25,3 +30,4 @@ build: [
     "@doc" {with-doc}
   ]
 ]
+dev-repo: "git+https://github.com/nguermond/abella-mcp.git"

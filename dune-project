@@ -1,7 +1,12 @@
 (lang dune 3.7)
 (name abella_mcp)
 (generate_opam_files true)
+(source (github nguermond/abella-mcp))
+(license GPL-3.0-or-later)
+(authors "Nathan Guermond")
+(maintainers "nguermond@proton.me")
 
+ 
 (package
  (name abella_mcp)
  (version 0.1.1)
