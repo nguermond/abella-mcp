@@ -4,7 +4,7 @@ This project exposes the [Abella](https://abella-prover.org/) proof assistant
 to an agent via an MCP server. The server exposes several tools allowing for
 simultaneous interactive sessions. The proof state is rendered as a diff
 for more efficient token use. An abella to TeX tool (`abella2tex`) is also available
-via the server, but must be installed separately.
+via the server, but must be installed separately (to be released).
 
 ## Tools
 
