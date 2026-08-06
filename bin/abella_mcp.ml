@@ -26,7 +26,7 @@ let log fmt = Printf.eprintf ("[abella-mcp] " ^^ fmt ^^ "\n%!")
 
 let protocol_version = "2024-11-05"
 let server_name = "abella"
-let server_version = "0.1.1"
+let server_version = "0.2.0"
 
 let default_timeout = 5.0
 let send_timeout = 5.0
